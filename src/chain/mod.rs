@@ -124,4 +124,10 @@ pub enum FacilitatorLocalError {
     /// The payload decoding failed.
     #[error("Decoding error: {0}")]
     DecodingError(String),
+    /// The recipient address is not in the allowed whitelist.
+    #[error("Recipient not whitelisted: {0}")]
+    RecipientNotWhitelisted(MixedAddress),
+    /// The payment amount is below the minimum required.
+    #[error("Amount below minimum: {1} < {2}")]
+    AmountBelowMinimum(MixedAddress, String, String),
 }

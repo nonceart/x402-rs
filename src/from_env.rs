@@ -24,6 +24,15 @@ pub const ENV_RPC_POLYGON: &str = "RPC_URL_POLYGON";
 pub const ENV_RPC_SEI: &str = "RPC_URL_SEI";
 pub const ENV_RPC_SEI_TESTNET: &str = "RPC_URL_SEI_TESTNET";
 
+/// Comma-separated list of allowed recipient addresses for EIP-3009 transfers.
+/// If set, only these addresses can receive payments.
+/// Example: ALLOWED_RECIPIENTS=0x1234...,0x5678...
+pub const ENV_ALLOWED_RECIPIENTS: &str = "ALLOWED_RECIPIENTS";
+
+/// Minimum required USDC amount in wei units (6 decimals).
+/// Example: MIN_USDC=10000 (= 0.01 USDC)
+pub const ENV_MIN_USDC: &str = "MIN_USDC";
+
 pub fn rpc_env_name_from_network(network: Network) -> &'static str {
     match network {
         Network::BaseSepolia => ENV_RPC_BASE_SEPOLIA,
@@ -108,6 +117,52 @@ impl SignerType {
     }
 }
 
+use crate::types::EvmAddress;
+
+/// Load the allowed recipients whitelist from the environment.
+/// Returns `None` if the environment variable is not set or is empty.
+/// Returns `Some(Vec<EvmAddress>)` with the parsed addresses if set.
+/// Returns an error if any address fails to parse.
+pub fn allowed_recipients_from_env() -> Result<Option<Vec<EvmAddress>>, Box<dyn std::error::Error>> {
+    let raw = match env::var(ENV_ALLOWED_RECIPIENTS) {
+        Ok(val) if !val.trim().is_empty() => val,
+        _ => return Ok(None),
+    };
+
+    let addresses: Result<Vec<EvmAddress>, _> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(EvmAddress::from_str)
+        .collect();
+
+    match addresses {
+        Ok(addrs) if addrs.is_empty() => Ok(None),
+        Ok(addrs) => Ok(Some(addrs)),
+        Err(_) => Err(format!(
+            "Failed to parse {ENV_ALLOWED_RECIPIENTS}: invalid address format"
+        )
+        .into()),
+    }
+}
+
+/// Load the minimum USDC amount from the environment.
+/// Returns `None` if the environment variable is not set or is empty.
+/// The value should be in wei units (USDC has 6 decimals, so 10000 = 0.01 USDC).
+pub fn min_usdc_from_env() -> Result<Option<u128>, Box<dyn std::error::Error>> {
+    let raw = match env::var(ENV_MIN_USDC) {
+        Ok(val) if !val.trim().is_empty() => val,
+        _ => return Ok(None),
+    };
+
+    let amount: u128 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("Failed to parse {ENV_MIN_USDC}: expected a valid integer"))?;
+
+    Ok(Some(amount))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +233,175 @@ mod tests {
         assert_eq!(signers.len(), 2);
         assert!(signers.contains(&expected_primary));
         assert!(signers.contains(&expected_secondary));
+    }
+
+    #[test]
+    fn allowed_recipients_returns_none_when_not_set() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        unsafe { env::remove_var(ENV_ALLOWED_RECIPIENTS) };
+
+        let result = allowed_recipients_from_env().expect("should not error");
+        assert!(result.is_none());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn allowed_recipients_returns_none_when_empty() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        override_var.set("");
+
+        let result = allowed_recipients_from_env().expect("should not error");
+        assert!(result.is_none());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn allowed_recipients_parses_single_address() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        override_var.set("0x1234567890123456789012345678901234567890");
+
+        let result = allowed_recipients_from_env().expect("should not error");
+        assert!(result.is_some());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(
+            addrs[0].to_string().to_lowercase(),
+            "0x1234567890123456789012345678901234567890"
+        );
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn allowed_recipients_parses_multiple_addresses() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        override_var.set(
+            "0x1234567890123456789012345678901234567890,0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        );
+
+        let result = allowed_recipients_from_env().expect("should not error");
+        assert!(result.is_some());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 2);
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn allowed_recipients_handles_whitespace() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        override_var.set(
+            " 0x1234567890123456789012345678901234567890 , 0xabcdefabcdefabcdefabcdefabcdefabcdefabcd ",
+        );
+
+        let result = allowed_recipients_from_env().expect("should not error");
+        assert!(result.is_some());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 2);
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn allowed_recipients_errors_on_invalid_address() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_ALLOWED_RECIPIENTS);
+        override_var.set("not_a_valid_address");
+
+        let result = allowed_recipients_from_env();
+        assert!(result.is_err());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_returns_none_when_not_set() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        unsafe { env::remove_var(ENV_MIN_USDC) };
+
+        let result = min_usdc_from_env().expect("should not error");
+        assert!(result.is_none());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_returns_none_when_empty() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("");
+
+        let result = min_usdc_from_env().expect("should not error");
+        assert!(result.is_none());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_parses_valid_amount() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("10000");
+
+        let result = min_usdc_from_env().expect("should not error");
+        assert_eq!(result, Some(10000));
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_parses_large_amount() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("1000000000000"); // 1 million USDC
+
+        let result = min_usdc_from_env().expect("should not error");
+        assert_eq!(result, Some(1_000_000_000_000));
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_handles_whitespace() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("  10000  ");
+
+        let result = min_usdc_from_env().expect("should not error");
+        assert_eq!(result, Some(10000));
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_errors_on_invalid_value() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("not_a_number");
+
+        let result = min_usdc_from_env();
+        assert!(result.is_err());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn min_usdc_errors_on_negative_value() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_MIN_USDC);
+        override_var.set("-100");
+
+        let result = min_usdc_from_env();
+        assert!(result.is_err());
+
+        drop(override_var);
     }
 }

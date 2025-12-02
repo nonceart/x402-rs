@@ -41,6 +41,8 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, instrument};
 use tracing_core::Level;
 
+use std::sync::OnceLock;
+
 use crate::chain::{FacilitatorLocalError, FromEnvByNetworkBuild, NetworkProviderOps};
 use crate::facilitator::Facilitator;
 use crate::from_env;
@@ -52,6 +54,46 @@ use crate::types::{
     SupportedPaymentKind, SupportedPaymentKindsResponse, TokenAmount, TransactionHash,
     TransferWithAuthorization, VerifyRequest, VerifyResponse, X402Version,
 };
+
+/// Configuration for payment validation loaded from environment variables.
+#[derive(Debug, Clone)]
+struct PaymentValidationConfig {
+    /// Whitelist of allowed recipient addresses (if set).
+    allowed_recipients: Option<Vec<EvmAddress>>,
+    /// Minimum USDC amount in wei units (if set).
+    min_usdc: Option<u128>,
+}
+
+/// Global lazy-initialized payment validation config.
+static PAYMENT_VALIDATION_CONFIG: OnceLock<PaymentValidationConfig> = OnceLock::new();
+
+/// Get the payment validation config, loading from environment on first access.
+fn get_payment_validation_config() -> &'static PaymentValidationConfig {
+    PAYMENT_VALIDATION_CONFIG.get_or_init(|| {
+        let allowed_recipients = from_env::allowed_recipients_from_env()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load ALLOWED_RECIPIENTS: {e}");
+                None
+            });
+        let min_usdc = from_env::min_usdc_from_env()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load MIN_USDC: {e}");
+                None
+            });
+
+        if let Some(ref addrs) = allowed_recipients {
+            tracing::info!("Recipient whitelist enabled with {} addresses", addrs.len());
+        }
+        if let Some(min) = min_usdc {
+            tracing::info!("Minimum USDC amount set to {min} wei");
+        }
+
+        PaymentValidationConfig {
+            allowed_recipients,
+            min_usdc,
+        }
+    })
+}
 
 sol!(
     #[allow(missing_docs)]
@@ -794,6 +836,59 @@ fn assert_enough_value(
     }
 }
 
+/// Check that the recipient is in the allowed whitelist.
+///
+/// If no whitelist is configured (None), all recipients are allowed.
+/// If a whitelist is configured, the recipient must be in the list.
+///
+/// # Errors
+/// Returns [`FacilitatorLocalError::RecipientNotWhitelisted`] if the recipient is not in the whitelist.
+#[instrument(skip_all, err, fields(
+    recipient = %recipient
+))]
+fn assert_recipient_whitelisted(
+    recipient: &EvmAddress,
+    whitelist: &Option<Vec<EvmAddress>>,
+) -> Result<(), FacilitatorLocalError> {
+    if let Some(allowed) = whitelist {
+        if !allowed.contains(recipient) {
+            return Err(FacilitatorLocalError::RecipientNotWhitelisted(
+                (*recipient).into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check that the payment amount meets the minimum requirement.
+///
+/// If no minimum is configured (None), any amount is allowed.
+/// If a minimum is configured, the amount must be >= minimum.
+///
+/// # Errors
+/// Returns [`FacilitatorLocalError::AmountBelowMinimum`] if the amount is below the minimum.
+#[instrument(skip_all, err, fields(
+    amount = %amount,
+    minimum = ?minimum
+))]
+fn assert_minimum_amount(
+    payer: &EvmAddress,
+    amount: &U256,
+    minimum: &Option<u128>,
+) -> Result<(), FacilitatorLocalError> {
+    if let Some(min) = minimum {
+        let min_u256 = U256::from(*min);
+        if *amount < min_u256 {
+            return Err(FacilitatorLocalError::AmountBelowMinimum(
+                (*payer).into(),
+                amount.to_string(),
+                min_u256.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check whether contract code is present at `address`.
 ///
 /// Uses `eth_getCode` against this provider. This is useful after a counterfactual
@@ -892,10 +987,12 @@ async fn assert_domain<P: Provider>(
 
 /// Runs all preconditions needed for a successful payment:
 /// - Valid scheme, network, and receiver.
+/// - Recipient is in whitelist (if ALLOWED_RECIPIENTS is configured).
 /// - Valid time window (validAfter/validBefore).
 /// - Correct EIP-712 domain construction.
 /// - Sufficient on-chain balance.
 /// - Sufficient value in payload.
+/// - Value meets minimum requirement (if MIN_USDC is configured).
 #[instrument(skip_all, err)]
 async fn assert_valid_payment<P: Provider>(
     provider: P,
@@ -944,6 +1041,11 @@ async fn assert_valid_payment<P: Provider>(
             requirements_to.to_string(),
         ));
     }
+
+    // Check recipient whitelist (if configured)
+    let config = get_payment_validation_config();
+    assert_recipient_whitelisted(&payload_to, &config.allowed_recipients)?;
+
     let valid_after = payment_payload.authorization.valid_after;
     let valid_before = payment_payload.authorization.valid_before;
     assert_time(payer.into(), valid_after, valid_before)?;
@@ -965,6 +1067,9 @@ async fn assert_valid_payment<P: Provider>(
     .await?;
     let value: U256 = payment_payload.authorization.value.into();
     assert_enough_value(&payer, &value, &amount_required)?;
+
+    // Check minimum amount (if configured)
+    assert_minimum_amount(&payer, &value, &config.min_usdc)?;
 
     let payment = ExactEvmPayment {
         chain: *chain,

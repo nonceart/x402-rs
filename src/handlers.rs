@@ -215,6 +215,24 @@ impl IntoResponse for FacilitatorLocalError {
                 )),
             )
                 .into_response(),
+            FacilitatorLocalError::RecipientNotWhitelisted(payer) => (
+                StatusCode::OK,
+                Json(VerifyResponse::invalid(
+                    Some(payer),
+                    FacilitatorErrorReason::FreeForm("recipient_not_whitelisted".to_string()),
+                )),
+            )
+                .into_response(),
+            FacilitatorLocalError::AmountBelowMinimum(payer, amount, minimum) => (
+                StatusCode::OK,
+                Json(VerifyResponse::invalid(
+                    Some(payer),
+                    FacilitatorErrorReason::FreeForm(format!(
+                        "amount_below_minimum: {amount} < {minimum}"
+                    )),
+                )),
+            )
+                .into_response(),
         }
     }
 }
