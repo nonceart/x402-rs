@@ -127,6 +127,9 @@ pub enum FacilitatorLocalError {
     /// The recipient address is not in the allowed whitelist.
     #[error("Recipient not whitelisted: {0}")]
     RecipientNotWhitelisted(MixedAddress),
+    /// The recipient address is in the disallowed blacklist.
+    #[error("Recipient blacklisted: {0}")]
+    RecipientBlacklisted(MixedAddress),
     /// The payment amount is below the minimum required.
     #[error("Amount below minimum: {1} < {2}")]
     AmountBelowMinimum(MixedAddress, String, String),

@@ -223,6 +223,14 @@ impl IntoResponse for FacilitatorLocalError {
                 )),
             )
                 .into_response(),
+            FacilitatorLocalError::RecipientBlacklisted(payer) => (
+                StatusCode::OK,
+                Json(VerifyResponse::invalid(
+                    Some(payer),
+                    FacilitatorErrorReason::FreeForm("recipient_blacklisted".to_string()),
+                )),
+            )
+                .into_response(),
             FacilitatorLocalError::AmountBelowMinimum(payer, amount, minimum) => (
                 StatusCode::OK,
                 Json(VerifyResponse::invalid(

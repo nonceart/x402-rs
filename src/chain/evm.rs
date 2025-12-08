@@ -60,6 +60,8 @@ use crate::types::{
 struct PaymentValidationConfig {
     /// Whitelist of allowed recipient addresses (if set).
     allowed_recipients: Option<Vec<EvmAddress>>,
+    /// Blacklist of disallowed recipient addresses (if set).
+    disallowed_recipients: Option<Vec<EvmAddress>>,
     /// Minimum USDC amount in wei units (if set).
     min_usdc: Option<u128>,
 }
@@ -75,6 +77,11 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
                 tracing::warn!("Failed to load ALLOWED_RECIPIENTS: {e}");
                 None
             });
+        let disallowed_recipients = from_env::disallowed_recipients_from_env()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load DISALLOWED_RECIPIENTS: {e}");
+                None
+            });
         let min_usdc = from_env::min_usdc_from_env()
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to load MIN_USDC: {e}");
@@ -84,12 +91,16 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
         if let Some(ref addrs) = allowed_recipients {
             tracing::info!("Recipient whitelist enabled with {} addresses", addrs.len());
         }
+        if let Some(ref addrs) = disallowed_recipients {
+            tracing::info!("Recipient blacklist enabled with {} addresses", addrs.len());
+        }
         if let Some(min) = min_usdc {
             tracing::info!("Minimum USDC amount set to {min} wei");
         }
 
         PaymentValidationConfig {
             allowed_recipients,
+            disallowed_recipients,
             min_usdc,
         }
     })
@@ -860,6 +871,30 @@ fn assert_recipient_whitelisted(
     Ok(())
 }
 
+/// Check that the recipient is not in the disallowed blacklist.
+///
+/// If no blacklist is configured (None), all recipients are allowed.
+/// If a blacklist is configured, the recipient must not be in the list.
+///
+/// # Errors
+/// Returns [`FacilitatorLocalError::RecipientBlacklisted`] if the recipient is in the blacklist.
+#[instrument(skip_all, err, fields(
+    recipient = %recipient
+))]
+fn assert_recipient_not_blacklisted(
+    recipient: &EvmAddress,
+    blacklist: &Option<Vec<EvmAddress>>,
+) -> Result<(), FacilitatorLocalError> {
+    if let Some(disallowed) = blacklist {
+        if disallowed.contains(recipient) {
+            return Err(FacilitatorLocalError::RecipientBlacklisted(
+                (*recipient).into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check that the payment amount meets the minimum requirement.
 ///
 /// If no minimum is configured (None), any amount is allowed.
@@ -988,6 +1023,7 @@ async fn assert_domain<P: Provider>(
 /// Runs all preconditions needed for a successful payment:
 /// - Valid scheme, network, and receiver.
 /// - Recipient is in whitelist (if ALLOWED_RECIPIENTS is configured).
+/// - Recipient is not in blacklist (if DISALLOWED_RECIPIENTS is configured).
 /// - Valid time window (validAfter/validBefore).
 /// - Correct EIP-712 domain construction.
 /// - Sufficient on-chain balance.
@@ -1042,9 +1078,10 @@ async fn assert_valid_payment<P: Provider>(
         ));
     }
 
-    // Check recipient whitelist (if configured)
+    // Check recipient whitelist and blacklist (if configured)
     let config = get_payment_validation_config();
     assert_recipient_whitelisted(&payload_to, &config.allowed_recipients)?;
+    assert_recipient_not_blacklisted(&payload_to, &config.disallowed_recipients)?;
 
     let valid_after = payment_payload.authorization.valid_after;
     let valid_before = payment_payload.authorization.valid_before;
