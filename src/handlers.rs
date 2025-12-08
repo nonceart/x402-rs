@@ -231,6 +231,14 @@ impl IntoResponse for FacilitatorLocalError {
                 )),
             )
                 .into_response(),
+            FacilitatorLocalError::InvalidNonceartNonce(reason) => (
+                StatusCode::OK,
+                Json(VerifyResponse::invalid(
+                    None,
+                    FacilitatorErrorReason::FreeForm(format!("invalid_nonceart_nonce: {reason}")),
+                )),
+            )
+                .into_response(),
             FacilitatorLocalError::AmountBelowMinimum(payer, amount, minimum) => (
                 StatusCode::OK,
                 Json(VerifyResponse::invalid(

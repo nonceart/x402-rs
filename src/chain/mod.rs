@@ -133,4 +133,7 @@ pub enum FacilitatorLocalError {
     /// The payment amount is below the minimum required.
     #[error("Amount below minimum: {1} < {2}")]
     AmountBelowMinimum(MixedAddress, String, String),
+    /// The nonce does not match a valid NonceArt operation (TIP, BUY, FUND with ToS).
+    #[error("Invalid NonceArt nonce: {0}")]
+    InvalidNonceartNonce(String),
 }

@@ -64,6 +64,8 @@ struct PaymentValidationConfig {
     disallowed_recipients: Option<Vec<EvmAddress>>,
     /// Minimum USDC amount in wei units (if set).
     min_usdc: Option<u128>,
+    /// Whether to validate nonces as NonceArt operations (TIP, BUY, FUND with ToS).
+    validate_nonceart_nonce: bool,
 }
 
 /// Global lazy-initialized payment validation config.
@@ -87,6 +89,7 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
                 tracing::warn!("Failed to load MIN_USDC: {e}");
                 None
             });
+        let validate_nonceart_nonce = from_env::validate_nonceart_nonce_from_env();
 
         if let Some(ref addrs) = allowed_recipients {
             tracing::info!("Recipient whitelist enabled with {} addresses", addrs.len());
@@ -97,11 +100,15 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
         if let Some(min) = min_usdc {
             tracing::info!("Minimum USDC amount set to {min} wei");
         }
+        if validate_nonceart_nonce {
+            tracing::info!("NonceArt nonce validation enabled (TIP, BUY, FUND only)");
+        }
 
         PaymentValidationConfig {
             allowed_recipients,
             disallowed_recipients,
             min_usdc,
+            validate_nonceart_nonce,
         }
     })
 }
@@ -924,6 +931,92 @@ fn assert_minimum_amount(
     Ok(())
 }
 
+// NonceArt operation opcodes (non-treasury operations)
+const NONCEART_OPCODE_BUY: u8 = 0x0b;
+const NONCEART_OPCODE_TIP: u8 = 0x0c;
+const NONCEART_OPCODE_FUND: u8 = 0x0d;
+
+// Terms of Service acceptance format
+const NONCEART_TOS_SEPARATOR: u8 = 0x00;
+const NONCEART_TOS_STRING: &[u8; 22] = b"I accept nonce.art/tos";
+
+/// Validate that a nonce represents a valid NonceArt operation (TIP, BUY, or FUND).
+///
+/// NonceArt nonces have the following structure:
+/// - Byte 0: Opcode (operation type)
+/// - Bytes 1-2: Local nonce (random 16-bit value)
+/// - Bytes 3-31: Arguments (operation-specific data)
+///
+/// For non-treasury operations (TIP, BUY, FUND), the arguments include a Terms of Service
+/// acceptance consisting of a separator byte (0x00) followed by "I accept nonce.art/tos".
+///
+/// # Arguments layout:
+/// - TIP (0x0c) / FUND (0x0d): Point (3 bytes) + ToS (23 bytes)
+/// - BUY (0x0b): Rectangle (6 bytes) + ToS (23 bytes)
+///
+/// # Errors
+/// Returns [`FacilitatorLocalError::InvalidNonceartNonce`] if the nonce doesn't match
+/// a valid NonceArt operation format.
+#[instrument(skip_all, err)]
+fn assert_valid_nonceart_nonce(nonce: &[u8; 32]) -> Result<(), FacilitatorLocalError> {
+    let opcode = nonce[0];
+    // Arguments start at byte 3 (after opcode + 2-byte local nonce)
+    let args = &nonce[3..];
+
+    match opcode {
+        NONCEART_OPCODE_TIP | NONCEART_OPCODE_FUND => {
+            // Point (3 bytes) + ToS (23 bytes) = 26 bytes
+            // ToS starts at args[3] (after Point)
+            let tos_start = 3;
+            validate_nonceart_tos(&args[tos_start..tos_start + 23], opcode)?;
+            Ok(())
+        }
+        NONCEART_OPCODE_BUY => {
+            // Rectangle (6 bytes) + ToS (23 bytes) = 29 bytes
+            // ToS starts at args[6] (after Rectangle)
+            let tos_start = 6;
+            validate_nonceart_tos(&args[tos_start..tos_start + 23], opcode)?;
+            Ok(())
+        }
+        _ => Err(FacilitatorLocalError::InvalidNonceartNonce(format!(
+            "invalid opcode 0x{:02x}, expected TIP (0x0c), BUY (0x0b), or FUND (0x0d)",
+            opcode
+        ))),
+    }
+}
+
+/// Validate the Terms of Service acceptance portion of a NonceArt nonce.
+fn validate_nonceart_tos(tos_bytes: &[u8], opcode: u8) -> Result<(), FacilitatorLocalError> {
+    let op_name = match opcode {
+        NONCEART_OPCODE_TIP => "TIP",
+        NONCEART_OPCODE_BUY => "BUY",
+        NONCEART_OPCODE_FUND => "FUND",
+        _ => "UNKNOWN",
+    };
+
+    if tos_bytes.len() < 23 {
+        return Err(FacilitatorLocalError::InvalidNonceartNonce(format!(
+            "{op_name}: ToS bytes too short ({} < 23)",
+            tos_bytes.len()
+        )));
+    }
+
+    if tos_bytes[0] != NONCEART_TOS_SEPARATOR {
+        return Err(FacilitatorLocalError::InvalidNonceartNonce(format!(
+            "{op_name}: invalid ToS separator (expected 0x00, got 0x{:02x})",
+            tos_bytes[0]
+        )));
+    }
+
+    if &tos_bytes[1..23] != NONCEART_TOS_STRING {
+        return Err(FacilitatorLocalError::InvalidNonceartNonce(format!(
+            "{op_name}: invalid ToS string"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Check whether contract code is present at `address`.
 ///
 /// Uses `eth_getCode` against this provider. This is useful after a counterfactual
@@ -1024,6 +1117,7 @@ async fn assert_domain<P: Provider>(
 /// - Valid scheme, network, and receiver.
 /// - Recipient is in whitelist (if ALLOWED_RECIPIENTS is configured).
 /// - Recipient is not in blacklist (if DISALLOWED_RECIPIENTS is configured).
+/// - Nonce is valid NonceArt operation (if VALIDATE_NONCEART_NONCE is enabled).
 /// - Valid time window (validAfter/validBefore).
 /// - Correct EIP-712 domain construction.
 /// - Sufficient on-chain balance.
@@ -1082,6 +1176,11 @@ async fn assert_valid_payment<P: Provider>(
     let config = get_payment_validation_config();
     assert_recipient_whitelisted(&payload_to, &config.allowed_recipients)?;
     assert_recipient_not_blacklisted(&payload_to, &config.disallowed_recipients)?;
+
+    // Check nonce is valid NonceArt operation (if enabled)
+    if config.validate_nonceart_nonce {
+        assert_valid_nonceart_nonce(&payment_payload.authorization.nonce.0)?;
+    }
 
     let valid_after = payment_payload.authorization.valid_after;
     let valid_before = payment_payload.authorization.valid_before;
@@ -1534,5 +1633,97 @@ mod tests {
             let nonce_lock = manager.nonces.get(&test_address).unwrap();
             assert_eq!(*nonce_lock.lock().await, u64::MAX);
         }
+    }
+
+    // Helper to build a NonceArt nonce for testing
+    fn build_nonce(opcode: u8, tos_offset: usize) -> [u8; 32] {
+        let mut nonce = [0u8; 32];
+        nonce[0] = opcode;
+        // Bytes 1-2: local nonce (arbitrary)
+        nonce[1] = 0x12;
+        nonce[2] = 0x34;
+        // Set ToS at the correct offset (after opcode + local_nonce + args prefix)
+        // ToS offset is relative to args (byte 3), so absolute position is 3 + tos_offset
+        let tos_start = 3 + tos_offset;
+        nonce[tos_start] = NONCEART_TOS_SEPARATOR; // 0x00
+        nonce[tos_start + 1..tos_start + 23].copy_from_slice(NONCEART_TOS_STRING);
+        nonce
+    }
+
+    #[test]
+    fn test_valid_tip_nonce() {
+        // TIP: opcode 0x0c, Point (3 bytes) + ToS (23 bytes)
+        // ToS starts at args[3], so tos_offset = 3
+        let nonce = build_nonce(NONCEART_OPCODE_TIP, 3);
+        assert!(assert_valid_nonceart_nonce(&nonce).is_ok());
+    }
+
+    #[test]
+    fn test_valid_buy_nonce() {
+        // BUY: opcode 0x0b, Rectangle (6 bytes) + ToS (23 bytes)
+        // ToS starts at args[6], so tos_offset = 6
+        let nonce = build_nonce(NONCEART_OPCODE_BUY, 6);
+        assert!(assert_valid_nonceart_nonce(&nonce).is_ok());
+    }
+
+    #[test]
+    fn test_valid_fund_nonce() {
+        // FUND: opcode 0x0d, Point (3 bytes) + ToS (23 bytes)
+        // ToS starts at args[3], so tos_offset = 3
+        let nonce = build_nonce(NONCEART_OPCODE_FUND, 3);
+        assert!(assert_valid_nonceart_nonce(&nonce).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_opcode_rejected() {
+        // Use an invalid opcode (e.g., RESERVE = 0x00)
+        let nonce = build_nonce(0x00, 3);
+        let result = assert_valid_nonceart_nonce(&nonce);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FacilitatorLocalError::InvalidNonceartNonce(_)));
+    }
+
+    #[test]
+    fn test_invalid_tos_separator_rejected() {
+        let mut nonce = build_nonce(NONCEART_OPCODE_TIP, 3);
+        // Corrupt the ToS separator (should be 0x00)
+        nonce[6] = 0xFF; // byte 3 + 3 = 6 is where ToS separator is
+        let result = assert_valid_nonceart_nonce(&nonce);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FacilitatorLocalError::InvalidNonceartNonce(_)));
+    }
+
+    #[test]
+    fn test_invalid_tos_string_rejected() {
+        let mut nonce = build_nonce(NONCEART_OPCODE_TIP, 3);
+        // Corrupt the ToS string
+        nonce[7] = b'X'; // Change first char of ToS string
+        let result = assert_valid_nonceart_nonce(&nonce);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FacilitatorLocalError::InvalidNonceartNonce(_)));
+    }
+
+    #[test]
+    fn test_random_nonce_rejected() {
+        // A completely random nonce should fail
+        let nonce: [u8; 32] = [
+            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
+        let result = assert_valid_nonceart_nonce(&nonce);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_treasury_opcode_rejected() {
+        // Treasury operations should be rejected (e.g., SET_PIXELS = 0x01)
+        let nonce = build_nonce(0x01, 3);
+        let result = assert_valid_nonceart_nonce(&nonce);
+        assert!(result.is_err());
     }
 }

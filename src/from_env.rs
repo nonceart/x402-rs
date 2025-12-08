@@ -38,6 +38,11 @@ pub const ENV_DISALLOWED_RECIPIENTS: &str = "DISALLOWED_RECIPIENTS";
 /// Example: MIN_USDC=10000 (= 0.01 USDC)
 pub const ENV_MIN_USDC: &str = "MIN_USDC";
 
+/// Enable NonceArt nonce validation for EIP-3009 transfers.
+/// When enabled, only TIP, BUY, and FUND operations with valid ToS acceptance are allowed.
+/// Example: VALIDATE_NONCEART_NONCE=true
+pub const ENV_VALIDATE_NONCEART_NONCE: &str = "VALIDATE_NONCEART_NONCE";
+
 pub fn rpc_env_name_from_network(network: Network) -> &'static str {
     match network {
         Network::BaseSepolia => ENV_RPC_BASE_SEPOLIA,
@@ -194,6 +199,16 @@ pub fn min_usdc_from_env() -> Result<Option<u128>, Box<dyn std::error::Error>> {
         .map_err(|_| format!("Failed to parse {ENV_MIN_USDC}: expected a valid integer"))?;
 
     Ok(Some(amount))
+}
+
+/// Load the NonceArt nonce validation setting from the environment.
+/// Returns `true` if the environment variable is set to "true" (case-insensitive).
+/// Returns `false` if the environment variable is not set, empty, or set to any other value.
+pub fn validate_nonceart_nonce_from_env() -> bool {
+    match env::var(ENV_VALIDATE_NONCEART_NONCE) {
+        Ok(val) => val.trim().eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +535,88 @@ mod tests {
 
         let result = min_usdc_from_env();
         assert!(result.is_err());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_returns_false_when_not_set() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+        unsafe { env::remove_var(ENV_VALIDATE_NONCEART_NONCE) };
+
+        let result = validate_nonceart_nonce_from_env();
+        assert!(!result);
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_returns_false_when_empty() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+        override_var.set("");
+
+        let result = validate_nonceart_nonce_from_env();
+        assert!(!result);
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_returns_true_when_true() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+        override_var.set("true");
+
+        let result = validate_nonceart_nonce_from_env();
+        assert!(result);
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_is_case_insensitive() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+
+        override_var.set("TRUE");
+        assert!(validate_nonceart_nonce_from_env());
+
+        override_var.set("True");
+        assert!(validate_nonceart_nonce_from_env());
+
+        override_var.set("TrUe");
+        assert!(validate_nonceart_nonce_from_env());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_returns_false_for_other_values() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+
+        override_var.set("false");
+        assert!(!validate_nonceart_nonce_from_env());
+
+        override_var.set("yes");
+        assert!(!validate_nonceart_nonce_from_env());
+
+        override_var.set("1");
+        assert!(!validate_nonceart_nonce_from_env());
+
+        drop(override_var);
+    }
+
+    #[test]
+    fn validate_nonceart_nonce_handles_whitespace() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let override_var = EnvOverride::new(ENV_VALIDATE_NONCEART_NONCE);
+        override_var.set("  true  ");
+
+        let result = validate_nonceart_nonce_from_env();
+        assert!(result);
 
         drop(override_var);
     }
