@@ -106,6 +106,26 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
     })
 }
 
+/// Number of block confirmations to wait for after transaction broadcast.
+/// Default: 0 (preconfirmation mode for Flashblocks-enabled RPCs like Alchemy).
+/// Set TX_CONFIRMATIONS=1 for traditional 1-block confirmation.
+static TX_CONFIRMATIONS: OnceLock<u64> = OnceLock::new();
+
+fn get_tx_confirmations() -> u64 {
+    *TX_CONFIRMATIONS.get_or_init(|| {
+        let confirmations = std::env::var("TX_CONFIRMATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        tracing::info!(
+            confirmations,
+            "Transaction confirmation mode: {}",
+            if confirmations == 0 { "preconfirmation (Flashblocks)" } else { "standard" }
+        );
+        confirmations
+    })
+}
+
 sol!(
     #[allow(missing_docs)]
     #[allow(clippy::too_many_arguments)]
@@ -611,7 +631,7 @@ where
                     self.send_transaction(MetaTransaction {
                         to: transfer_call.tx.target(),
                         calldata: transfer_call.tx.calldata().clone(),
-                        confirmations: 1,
+                        confirmations: get_tx_confirmations(),
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -645,7 +665,7 @@ where
                     self.send_transaction(MetaTransaction {
                         to: MULTICALL3_ADDRESS,
                         calldata: aggregate_call.abi_encode().into(),
-                        confirmations: 1,
+                        confirmations: get_tx_confirmations(),
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -670,7 +690,7 @@ where
                 self.send_transaction(MetaTransaction {
                     to: transfer_call.tx.target(),
                     calldata: transfer_call.tx.calldata().clone(),
-                    confirmations: 1,
+                    confirmations: get_tx_confirmations(),
                 })
                 .instrument(
                     tracing::info_span!("call_transferWithAuthorization_0",
