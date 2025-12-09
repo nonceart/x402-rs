@@ -106,23 +106,23 @@ fn get_payment_validation_config() -> &'static PaymentValidationConfig {
     })
 }
 
-/// Number of block confirmations to wait for after transaction broadcast.
-/// Default: 0 (preconfirmation mode for Flashblocks-enabled RPCs like Alchemy).
-/// Set TX_CONFIRMATIONS=1 for traditional 1-block confirmation.
-static TX_CONFIRMATIONS: OnceLock<u64> = OnceLock::new();
+/// Whether to skip waiting for transaction receipt (fire-and-forget mode).
+/// Default: true (return immediately after broadcast for fastest response).
+/// Set TX_SKIP_RECEIPT=false to wait for receipt confirmation.
+static TX_SKIP_RECEIPT: OnceLock<bool> = OnceLock::new();
 
-fn get_tx_confirmations() -> u64 {
-    *TX_CONFIRMATIONS.get_or_init(|| {
-        let confirmations = std::env::var("TX_CONFIRMATIONS")
+fn get_tx_skip_receipt() -> bool {
+    *TX_SKIP_RECEIPT.get_or_init(|| {
+        let skip = std::env::var("TX_SKIP_RECEIPT")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .map(|s| s != "false" && s != "0")
+            .unwrap_or(true);
         tracing::info!(
-            confirmations,
-            "Transaction confirmation mode: {}",
-            if confirmations == 0 { "preconfirmation (Flashblocks)" } else { "standard" }
+            skip_receipt = skip,
+            "Transaction mode: {}",
+            if skip { "fire-and-forget (fastest)" } else { "wait for receipt" }
         );
-        confirmations
+        skip
     })
 }
 
@@ -333,20 +333,45 @@ pub trait MetaEvmProvider {
     fn chain(&self) -> &EvmChain;
 
     /// Sends a meta-transaction to the network.
+    /// Returns either a full receipt (if waiting) or just txHash (fire-and-forget mode).
     fn send_transaction(
         &self,
         tx: MetaTransaction,
-    ) -> impl Future<Output = Result<TransactionReceipt, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<TransactionResult, Self::Error>> + Send;
 }
 
-/// Meta-transaction parameters: target address, calldata, and required confirmations.
+/// Meta-transaction parameters: target address and calldata.
 pub struct MetaTransaction {
     /// Target contract address.
     pub to: Address,
     /// Transaction calldata (encoded function call).
     pub calldata: Bytes,
-    /// Number of block confirmations to wait for.
-    pub confirmations: u64,
+}
+
+/// Result of sending a transaction - either a full receipt or just the hash (fire-and-forget).
+pub enum TransactionResult {
+    /// Full receipt with status (waited for confirmation).
+    Receipt(TransactionReceipt),
+    /// Just the hash (fire-and-forget mode, assumed success).
+    Hash(alloy::primitives::TxHash),
+}
+
+impl TransactionResult {
+    /// Get the transaction hash.
+    pub fn transaction_hash(&self) -> alloy::primitives::TxHash {
+        match self {
+            TransactionResult::Receipt(r) => r.transaction_hash,
+            TransactionResult::Hash(h) => *h,
+        }
+    }
+
+    /// Check if transaction succeeded. Returns true for fire-and-forget (assumed success).
+    pub fn status(&self) -> bool {
+        match self {
+            TransactionResult::Receipt(r) => r.status(),
+            TransactionResult::Hash(_) => true, // Assume success in fire-and-forget mode
+        }
+    }
 }
 
 impl MetaEvmProvider for EvmProvider {
@@ -397,11 +422,11 @@ impl MetaEvmProvider for EvmProvider {
     /// Returns [`FacilitatorLocalError::ContractCall`] if:
     /// - Gas price fetching fails (on legacy networks)
     /// - Transaction sending fails
-    /// - Receipt retrieval fails or times out
+    /// - Receipt retrieval fails or times out (when not in fire-and-forget mode)
     async fn send_transaction(
         &self,
         tx: MetaTransaction,
-    ) -> Result<TransactionReceipt, Self::Error> {
+    ) -> Result<TransactionResult, Self::Error> {
         let from_address = self.next_signer_address();
         let mut txr = TransactionRequest::default()
             .with_to(tx.to)
@@ -427,8 +452,13 @@ impl MetaEvmProvider for EvmProvider {
             }
         };
 
-        // Get receipt with timeout and error handling for nonce reset
-        // Default timeout of 30 seconds is reasonable for most EVM chains
+        // Fire-and-forget mode: return txHash immediately without waiting for receipt
+        if get_tx_skip_receipt() {
+            let tx_hash = *pending_tx.tx_hash();
+            return Ok(TransactionResult::Hash(tx_hash));
+        }
+
+        // Wait for receipt with timeout
         let timeout = std::time::Duration::from_secs(
             std::env::var("TX_RECEIPT_TIMEOUT_SECS")
                 .ok()
@@ -437,11 +467,11 @@ impl MetaEvmProvider for EvmProvider {
         );
 
         let watcher = pending_tx
-            .with_required_confirmations(tx.confirmations)
+            .with_required_confirmations(0)
             .with_timeout(Some(timeout));
 
         match watcher.get_receipt().await {
-            Ok(receipt) => Ok(receipt),
+            Ok(receipt) => Ok(TransactionResult::Receipt(receipt)),
             Err(e) => {
                 // Receipt fetch failed (timeout or other error) - reset nonce to force requery
                 self.nonce_manager.reset_nonce(from_address).await;
@@ -631,7 +661,6 @@ where
                     self.send_transaction(MetaTransaction {
                         to: transfer_call.tx.target(),
                         calldata: transfer_call.tx.calldata().clone(),
-                        confirmations: get_tx_confirmations(),
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -665,7 +694,6 @@ where
                     self.send_transaction(MetaTransaction {
                         to: MULTICALL3_ADDRESS,
                         calldata: aggregate_call.abi_encode().into(),
-                        confirmations: get_tx_confirmations(),
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -690,7 +718,6 @@ where
                 self.send_transaction(MetaTransaction {
                     to: transfer_call.tx.target(),
                     calldata: transfer_call.tx.calldata().clone(),
-                    confirmations: get_tx_confirmations(),
                 })
                 .instrument(
                     tracing::info_span!("call_transferWithAuthorization_0",
@@ -708,33 +735,34 @@ where
                 )
             }
         };
-        let receipt = transaction_receipt_fut.await?;
-        let success = receipt.status();
+        let result = transaction_receipt_fut.await?;
+        let tx_hash = result.transaction_hash();
+        let success = result.status();
         if success {
             tracing::event!(Level::INFO,
                 status = "ok",
-                tx = %receipt.transaction_hash,
+                tx = %tx_hash,
                 "transferWithAuthorization_0 succeeded"
             );
             Ok(SettleResponse {
                 success: true,
                 error_reason: None,
                 payer: payment.from.into(),
-                transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                transaction: Some(TransactionHash::Evm(tx_hash.0)),
                 network: payload.network,
             })
         } else {
             tracing::event!(
                 Level::WARN,
                 status = "failed",
-                tx = %receipt.transaction_hash,
+                tx = %tx_hash,
                 "transferWithAuthorization_0 failed"
             );
             Ok(SettleResponse {
                 success: false,
                 error_reason: Some(FacilitatorErrorReason::InvalidScheme),
                 payer: payment.from.into(),
-                transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                transaction: Some(TransactionHash::Evm(tx_hash.0)),
                 network: payload.network,
             })
         }
