@@ -196,8 +196,29 @@ impl IntoResponse for FacilitatorLocalError {
                 )),
             )
                 .into_response(),
-            FacilitatorLocalError::ContractCall(..)
-            | FacilitatorLocalError::InvalidAddress(..)
+            FacilitatorLocalError::ContractCall(ref msg) => {
+                // Check if this is a transport/network error (RPC provider issue)
+                // These should return 503 so clients know to retry with another facilitator
+                let lower = msg.to_lowercase();
+                if lower.contains("transport")
+                    || lower.contains("httperror")
+                    || lower.contains("status: 500")
+                    || lower.contains("temporary")
+                    || lower.contains("timeout")
+                    || lower.contains("connection")
+                {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: format!("RPC provider error: {}", msg),
+                        }),
+                    )
+                        .into_response()
+                } else {
+                    bad_request
+                }
+            }
+            FacilitatorLocalError::InvalidAddress(..)
             | FacilitatorLocalError::ClockError(_) => bad_request,
             FacilitatorLocalError::DecodingError(reason) => (
                 StatusCode::OK,
